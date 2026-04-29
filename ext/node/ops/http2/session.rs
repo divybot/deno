@@ -454,13 +454,21 @@ impl Http2Options {
           ffi::nghttp2_option_set_peer_max_concurrent_streams(options, 100);
         }
 
-        let max_outstanding_pings =
-          buffer[OptionsIndex::MaxOutstandingPings as usize];
-        if max_outstanding_pings > 0 {
-          ffi::nghttp2_option_set_max_outbound_ack(
-            options,
-            max_outstanding_pings as usize,
-          );
+        // The optionsBuffer is process-global, so a previous session's
+        // maxOutstandingPings can linger. Only forward it to nghttp2 when
+        // the matching flag bit is set on this updateOptionsBuffer call.
+        // Forwarding a stale value lowers nghttp2's max_outbound_ack
+        // threshold for an unrelated session and trips NGHTTP2_ERR_FLOODED
+        // on its very next inbound PING/SETTINGS.
+        if flags & (1 << OptionsIndex::MaxOutstandingPings as u32) != 0 {
+          let max_outstanding_pings =
+            buffer[OptionsIndex::MaxOutstandingPings as usize];
+          if max_outstanding_pings > 0 {
+            ffi::nghttp2_option_set_max_outbound_ack(
+              options,
+              max_outstanding_pings as usize,
+            );
+          }
         }
 
         let max_outstanding_settings =
@@ -819,7 +827,8 @@ unsafe extern "C" fn on_frame_recv_callback(
   } else if ft == ffi::NGHTTP2_GOAWAY as u32 {
     handle_goaway_frame(session, frame);
   } else if ft == ffi::NGHTTP2_PING as u32 {
-    if ff & ffi::NGHTTP2_FLAG_ACK as u8 != 0 {
+    let is_ack = ff & ffi::NGHTTP2_FLAG_ACK as u8 != 0;
+    if is_ack {
       // PING ACK from the peer. If we have an outstanding PING, consume it
       // and let JS handle the ack. Otherwise the peer sent us an
       // unsolicited PING ACK — Node treats this as a connection-level
@@ -828,12 +837,12 @@ unsafe extern "C" fn on_frame_recv_callback(
       // destroy the session with NghttpError(NGHTTP2_ERR_PROTO).
       if session.pending_pings > 0 {
         session.pending_pings -= 1;
-        handle_ping_frame(session);
+        handle_ping_frame(session, frame, true);
       } else {
         handle_unsolicited_ping_ack(session);
       }
     } else {
-      handle_ping_frame(session);
+      handle_ping_frame(session, frame, false);
     }
   } else if ft == ffi::NGHTTP2_ALTSVC as u32 {
     handle_alt_svc_frame(session, frame);
@@ -991,7 +1000,11 @@ fn handle_settings_frame(session: &Session) {
   callback.call(scope, recv.into(), &[]);
 }
 
-fn handle_ping_frame(session: &Session) {
+fn handle_ping_frame(
+  session: &Session,
+  frame: *const ffi::nghttp2_frame,
+  is_ack: bool,
+) {
   let mut isolate =
     // SAFETY: isolate pointer is valid for the session's lifetime
     unsafe { v8::Isolate::from_raw_isolate_ptr(session.isolate) };
@@ -999,14 +1012,34 @@ fn handle_ping_frame(session: &Session) {
   let context = v8::Local::new(scope, session.context.clone());
   let scope = &mut v8::ContextScope::new(scope, context);
 
+  // SAFETY: frame is a valid PING frame per nghttp2 callback contract
+  let opaque_data = unsafe { (*frame).ping.opaque_data };
+
+  let array_buffer = v8::ArrayBuffer::new(scope, 8);
+  let backing_store = array_buffer.get_backing_store();
+  if let Some(backing_data) = backing_store.data() {
+    // SAFETY: src is valid 8 bytes; dst has capacity 8.
+    unsafe {
+      std::ptr::copy_nonoverlapping(
+        opaque_data.as_ptr(),
+        backing_data.as_ptr() as *mut u8,
+        8,
+      );
+    }
+  }
+  let payload: v8::Local<v8::Value> =
+    v8::Uint8Array::new(scope, array_buffer, 0, 8)
+      .unwrap()
+      .into();
+  let ack = v8::Boolean::new(scope, is_ack);
+
   let state = session.op_state.borrow();
   let callbacks = state.borrow::<SessionCallbacks>();
   let recv = v8::Local::new(scope, &session.this);
   let callback = v8::Local::new(scope, &callbacks.ping_frame_cb);
   drop(state);
 
-  let arg = v8::null(scope);
-  callback.call(scope, recv.into(), &[arg.into()]);
+  callback.call(scope, recv.into(), &[payload, ack.into()]);
 }
 
 /// Inbound PING ACK with no matching outstanding PING. Mirrors Node's
