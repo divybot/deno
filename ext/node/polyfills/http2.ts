@@ -82,7 +82,6 @@ import {
   defaultTriggerAsyncIdScope,
   symbols,
 } from "ext:deno_node/internal/async_hooks.ts";
-import { AsyncResource } from "node:async_hooks";
 const { async_id_symbol } = symbols;
 import { kTimeout } from "ext:deno_node/internal/timers.mjs";
 // Use node:timers' setTimeout/clearTimeout so the returned Timeout object
