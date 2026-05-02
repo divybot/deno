@@ -3652,19 +3652,24 @@ class Http2Session extends EventEmitter {
       ? new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength)
       : Buffer.alloc(8);
 
-    // Track the pending ping so it can be cancelled when the session is
-    // destroyed before the ACK arrives. Matches Node's outstanding_pings_
-    // queue / ClearOutstandingPings in src/node_http2.cc.
-    state.pendingPings.push({ cb, sentAt: Date.now() });
-
+    // Submit the ping first; only enqueue the pending entry if nghttp2
+    // accepted it. Otherwise the JS queue would hold a stale {cb, sentAt}
+    // that a later inbound ACK would FIFO-match, firing the wrong callback
+    // (and leaking the entry until session close). Mirrors Node's
+    // Http2Session::Ping which adds to outstanding_pings_ only on success.
     const ret = this[kHandle].ping(buf);
+    if (ret !== 0) {
+      process.nextTick(cb, false, 0.0, undefined);
+      return false;
+    }
+    state.pendingPings.push({ cb, sentAt: Date.now() });
     // Drain nghttp2's mem_send queue so the PING actually leaves the socket.
     // The Rust ping op calls send_pending_data(), but on the JS-managed
     // write path (consume_stream is not used) that is a no-op and the bytes
     // would otherwise sit in nghttp2 until some unrelated activity flushes
     // them, leaving the peer's ACK to never arrive.
     scheduleSendPending(this);
-    return ret === 0;
+    return true;
   }
 
   [kInspect](depth, opts) {
