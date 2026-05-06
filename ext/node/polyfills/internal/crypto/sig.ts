@@ -211,7 +211,7 @@ export class SignImpl extends Writable {
       }
       throw err;
     }
-    return encoding ? ret.toString(encoding) : ret;
+    return encoding && encoding !== "buffer" ? ret.toString(encoding) : ret;
   }
 
   update(
