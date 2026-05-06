@@ -814,6 +814,7 @@ unsafe fn consume_read_callback(
     callbacks: callbacks_static,
   };
 
+  // Save+restore for re-entrant execute() calls — see HTTPParser::execute.
   let saved_data = inner.parser.data;
   inner.parser.data = &mut ctx as *mut ExecuteContext as *mut std::ffi::c_void;
 
@@ -1053,6 +1054,7 @@ impl HTTPParser {
       callbacks: callbacks_static,
     };
 
+    // Save+restore for re-entrant execute() calls — see HTTPParser::execute.
     let saved_data = inner.parser.data;
     inner.parser.data =
       &mut ctx as *mut ExecuteContext as *mut std::ffi::c_void;
